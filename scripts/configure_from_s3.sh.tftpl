@@ -1,0 +1,64 @@
+#!/bin/bash
+# Terraform renders the S3 bucket name and region into this script.
+# It runs at boot (EC2 user data) and through Systems Manager State Manager.
+set -Eeuo pipefail
+
+AWS_REGION="${aws_region}"
+ARTIFACT_BUCKET="${artifact_bucket}"
+WEB_ROOT=/var/www/html
+
+# Avoid two deployments racing when cloud-init and State Manager run together.
+mkdir -p /var/lock
+exec 9>/var/lock/morays-site-deploy.lock
+flock -w 600 9
+
+command -v aws >/dev/null || { echo "AWS CLI not found" >&2; exit 1; }
+
+# Retry briefly during first boot for instance-role propagation.
+release_id=""
+for attempt in 1 2 3 4 5 6; do
+  if release_id="$(aws s3 cp "s3://$ARTIFACT_BUCKET/current.txt" - --region "$AWS_REGION" --only-show-errors 2>/dev/null | tr -d '\r\n')"; then
+    if [[ "$release_id" =~ ^[0-9a-f]{64}$ ]]; then break; fi
+  fi
+  echo "Website release not available yet; attempt $attempt/6"
+  sleep 15
+done
+
+if [[ ! "$release_id" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "No published release yet. Run Ansible scripts/deploy.sh, then State Manager will retry." >&2
+  exit 1
+fi
+
+if [[ -f "$WEB_ROOT/.morays-release" ]] &&
+   [[ "$(cat "$WEB_ROOT/.morays-release")" == "$release_id" ]] &&
+   systemctl is-active --quiet httpd &&
+   curl --fail --silent --max-time 5 http://127.0.0.1/healthz | grep -q '^ok'; then
+  echo "Morays website release $release_id already healthy"
+  exit 0
+fi
+
+if ! rpm -q httpd >/dev/null 2>&1; then
+  dnf -y install httpd
+fi
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+aws s3 sync "s3://$ARTIFACT_BUCKET/releases/$release_id/" "$tmp_dir/" --region "$AWS_REGION" --only-show-errors
+
+# Validate all site assets before changing the live directory.
+for file in index.html healthz assets/style.css assets/app.js; do
+  test -s "$tmp_dir/$file" || { echo "Missing site asset: $file" >&2; exit 1; }
+done
+grep -q 'Morays Cloud DevOps Upgrade' "$tmp_dir/index.html"
+
+install -d -m 0755 "$WEB_ROOT/assets"
+install -m 0644 "$tmp_dir/index.html" "$WEB_ROOT/index.html"
+install -m 0644 "$tmp_dir/assets/style.css" "$WEB_ROOT/assets/style.css"
+install -m 0644 "$tmp_dir/assets/app.js" "$WEB_ROOT/assets/app.js"
+install -m 0644 "$tmp_dir/healthz" "$WEB_ROOT/healthz"
+
+systemctl enable --now httpd
+curl --fail --silent --max-time 10 http://127.0.0.1/healthz | grep -q '^ok'
+# Stamp the release only once HTTP is confirmed healthy.
+printf '%s\n' "$release_id" > "$WEB_ROOT/.morays-release"
+echo "Successfully deployed Morays release $release_id"
